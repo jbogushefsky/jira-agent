@@ -1,0 +1,126 @@
+name: jira-agent
+
+services:
+  backend:
+    build:
+      context: ./backend
+    ports:
+      - "8000:8000"
+      - "5678:5678"  # debugpy — attach VS Code here; listens passively, doesn't block startup
+    env_file:
+      - .env
+    environment:
+      MCP_ATLASSIAN_URL: http://mcp-atlassian:9000/mcp
+      WORKSPACES_ROOT: /workspaces
+      OTEL_SERVICE_NAME: jira-agent-backend
+      OTEL_EXPORTER_OTLP_ENDPOINT: otel-collector:4317
+    volumes:
+      - ./backend:/app
+      - C:/joa/vscode:/workspaces
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      mcp-atlassian:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks: [jira-agent-net]
+
+  # This project's own MCP server (querying processed tickets/flows for external MCP
+  # clients) — split out of the backend process so it can be built/deployed/scaled
+  # independently. Shares this codebase and Postgres with `backend`, but is a separate
+  # container/entrypoint (app/mcp_server/app.py, not app/main.py). Depends on `backend`
+  # being healthy first since that's what runs the Alembic migrations on boot.
+  jira-agent-mcp:
+    build:
+      context: ./backend
+    # Host port 8001 is already taken by dice-roll's backend on this machine — 8010 avoids
+    # the collision (confirmed live: "port is already allocated" on 8001).
+    command: ["uvicorn", "app.mcp_server.app:app", "--host", "0.0.0.0", "--port", "8010"]
+    ports:
+      - "8010:8010"
+    env_file:
+      - .env
+    environment:
+      OTEL_SERVICE_NAME: jira-agent-mcp
+      OTEL_EXPORTER_OTLP_ENDPOINT: otel-collector:4317
+    volumes:
+      - ./backend:/app
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      backend:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8010/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks: [jira-agent-net]
+
+  mcp-atlassian:
+    image: ghcr.io/sooperset/mcp-atlassian:latest
+    command: ["--transport", "streamable-http", "--port", "9000"]
+    env_file:
+      - .env
+    healthcheck:
+      # No curl/wget-friendly health route in this image, and it only binds IPv4 — just
+      # confirm the streamable-http port is accepting connections.
+      test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('127.0.0.1', 9000), 2)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks: [jira-agent-net]
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.114.0
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml
+    ports:
+      # Host ports offset from dice-roll's otel stack (16686/4318/9090) so both projects can
+      # run their own Jaeger side by side without a port clash.
+      - "4319:4318"
+    extra_hosts:
+      # so the otlphttp/mongo_sink exporter can reach ../otel-mongo-sink's host-mapped port
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - jaeger
+    networks: [jira-agent-net]
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+      METRICS_STORAGE_TYPE: prometheus
+      PROMETHEUS_SERVER_URL: http://prometheus:9090
+      PROMETHEUS_QUERY_SUPPORT_SPANMETRICS_CONNECTOR: "true"
+      PROMETHEUS_QUERY_NORMALIZE_CALLS: "true"
+      PROMETHEUS_QUERY_NORMALIZE_DURATION: "true"
+    ports:
+      - "16687:16686"
+    depends_on:
+      - prometheus
+    networks: [jira-agent-net]
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9091:9090"
+    networks: [jira-agent-net]
+
+networks:
+  jira-agent-net:
+    driver: bridge

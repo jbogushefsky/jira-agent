@@ -1,0 +1,53 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+        cors:
+          allowed_origins:
+            - "http://localhost:*"
+
+# Bridges the traces pipeline into a metrics pipeline: aggregates spans into RED metrics
+# (request rate, error rate, duration histogram) — this is what feeds Jaeger's SPM "Monitor" tab.
+connectors:
+  spanmetrics:
+    histogram:
+      explicit:
+        buckets: [100us, 1ms, 10ms, 100ms, 250ms, 500ms, 1s, 5s]
+    dimensions:
+      - name: http.method
+      - name: http.status_code
+
+processors:
+  batch:
+
+exporters:
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+  # Jaeger has no MongoDB storage backend — this is a side copy of raw spans into the existing
+  # service_logs_db.service_logs collection (see ../otel-mongo-sink), independent of the
+  # Jaeger/Prometheus SPM pipeline below. `encoding: json` is required — the sink only parses
+  # OTLP/HTTP JSON, not the exporter's default protobuf.
+  otlphttp/mongo_sink:
+    endpoint: http://host.docker.internal:4320
+    encoding: json
+    compression: none
+  prometheus:
+    endpoint: 0.0.0.0:8889
+  debug:
+    verbosity: detailed
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/jaeger, otlphttp/mongo_sink, spanmetrics, debug]
+    metrics:
+      receivers: [spanmetrics]
+      processors: [batch]
+      exporters: [prometheus]
